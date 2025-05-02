@@ -1,0 +1,14 @@
+{
+    "domain": "energiebe",
+    "name": "Energie.be",
+    "version": "0.0.1",
+    "config_flow": true,
+    "documentation": "https://github.com/@FabianMeul/home-assistant-energie-be",
+    "requirements": [
+        "beautifulsoup4",
+        "requests"
+    ],
+    "codeowners": [
+        "@FabianMeul"
+    ]
+}

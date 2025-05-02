@@ -1,0 +1,13 @@
+{
+    "name": "Energie.be",
+    "integration_type": "sensor",
+    "domain": "energiebe",
+    "documentation": "https://github.com/@FabianMeul/home-assistant-energie-be",
+    "codeowners": [
+        "@FabianMeul"
+    ],
+    "dependencies": [],
+    "config_flow": false,
+    "iot_class": "local_push",
+    "version": "0.0.1"
+}
