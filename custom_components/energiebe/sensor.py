@@ -10,6 +10,7 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(days=1)
+GAS_CONVERSION_FACTOR = 10.55
 
 URL = "https://energie.be/"
 
@@ -29,9 +30,13 @@ async def scrape_prices():
             # Convert from c€/kWh to €/kWh by dividing by 100
             return float(el.get_text().strip().replace(",", ".")) / 100
 
+        raw_gas_price = parse_price(prices[1])  # Gas price in €/kWh
+        converted_gas_price = raw_gas_price * GAS_CONVERSION_FACTOR  # Convert to €/m³
+
         return {
             "electricity": parse_price(prices[0]),
-            "gas": parse_price(prices[1]),
+            "gas_kwh": raw_gas_price,  # Gas price in €/kWh
+            "gas_m3": converted_gas_price,  # Converted gas price in €/m³
             "injection": parse_price(prices[2])
         }
     except Exception as e:
@@ -42,7 +47,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([
         EnergieBeSensor("electricity", "Electricity Price", "€/kWh"),
         EnergieBeSensor("injection", "Injection Price", "€/kWh"),
-        EnergieBeSensor("gas", "Gas Price", "€/kWh"),
+        EnergieBeSensor("gas_kwh", "Gas Price (€/kWh)", "€/kWh"),
+        EnergieBeSensor("gas_m3", "Gas Price (€/m³)", "€/m³"),
     ])
 
 class EnergieBeSensor(SensorEntity):
