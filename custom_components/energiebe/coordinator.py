@@ -6,6 +6,7 @@ import logging
 import re
 import ssl
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
@@ -27,6 +28,7 @@ from .const import (
     CONF_GOS_EAN,
     DOMAIN,
     FALLBACK_GAS_CONVERSION_FACTOR,
+    MAX_SCRAPE_ATTEMPTS,
     RETRY_INTERVAL,
     UPDATE_INTERVAL,
     URL,
@@ -54,10 +56,10 @@ class EnergieBeData:
         return self.gas_kwh * self.gas_conversion_factor
 
 
-_ORDER_PATTERN = re.compile(r"order:\s*(\d+)")
+_ORDER_PATTERN = re.compile(r"order:\s*(-?\d+)")
 
 # The price cards carry no label of their own; the only thing naming a fuel is
-# the switch button above them, which reads "Elektriciteit | Gas | Zonne-energie".
+# the radio picker beside them, which reads "Elektriciteit | Gas | Zonne-energie".
 # energie.be is Dutch only -- it sends lang="nl", ignores Accept-Language and has
 # no localised routes -- so there is nothing else to match on. If the wording ever
 # changes we fall through to the rendered order and log about it.
@@ -66,6 +68,13 @@ _FUEL_KEYWORDS: dict[str, tuple[str, ...]] = {
     "gas_kwh": ("gas",),
     "injection": ("zonne", "injectie"),
 }
+
+# The one element that only the tariff page carries. Its absence means the
+# instance served us some other page, which is a different fault from markup we
+# cannot parse -- worth another roll of the dice rather than a day of waiting.
+_TARIFF_MARKER = "app-fair-price-item"
+
+_SCRAPE_HOST = urlparse(URL).hostname or ""
 
 # A tariff outside this band means we read the wrong element, or the page
 # stopped quoting c€/kWh. Either way, better to fail than to publish it.
@@ -89,37 +98,68 @@ def _fuel_for(label: str) -> str | None:
     return None
 
 
+def _price_element(item: Tag) -> Tag | None:
+    """Return the div holding one card's variable tariff.
+
+    A card renders three figures in the same ``ui-large`` class -- the
+    "% goedkoper" badge, the variable tariff and the yearly standing charge --
+    so key on the label sitting beside the number, not on the class alone.
+    """
+    for label in item.find_all("div", class_="d-inline-block"):
+        if "kwh" not in label.get_text().casefold():
+            continue
+        parent = label.parent
+        if isinstance(parent, Tag):
+            value = parent.find("div", class_="ui-large")
+            if isinstance(value, Tag):
+                return value
+    return None
+
+
 def _cards(soup: BeautifulSoup) -> list[_Card]:
-    """Read every price card with the flex order the page renders it at.
+    """Read every price card, keyed by the position the page lays it out at.
 
     DOM order and the CSS ``order`` property are allowed to disagree -- the
-    latter is what the page actually lays out, so that is what we key on.
+    latter is what the page actually lays out, so rank on it and hand back
+    contiguous positions that the fuel labels can be indexed against.
     """
-    cards: list[_Card] = []
+    found: list[tuple[int, int, float]] = []
     for index, item in enumerate(soup.find_all("app-fair-price-item")):
-        element = item.find("div", class_="big-price")
+        element = _price_element(item)
         if not isinstance(element, Tag):
             continue
         try:
-            # Tariffs are rendered as c€/kWh, e.g. " 15,98 ".
+            # Tariffs are rendered as c€/kWh, e.g. " 18,77 ".
             value = float(element.get_text().strip().replace(",", ".")) / 100
         except ValueError:
             continue
         match = _ORDER_PATTERN.search(str(item.get("style") or ""))
-        cards.append(_Card(order=int(match.group(1)) if match else index, value=value))
-    return cards
+        found.append((int(match.group(1)) if match else index, index, value))
+
+    found.sort(key=lambda entry: (entry[0], entry[1]))
+    return [
+        _Card(order=position, value=value)
+        for position, (_, _, value) in enumerate(found)
+    ]
 
 
 def _labels(soup: BeautifulSoup) -> list[str]:
-    """Read the fuel names from the switch button, in the order it shows them."""
-    switch = soup.find("app-switch-button")
-    if not isinstance(switch, Tag):
+    """Read the fuel names from the radio picker, in the order it shows them.
+
+    Scoped to the tariff section: the page carries a second, unrelated picker
+    ("Particulier | Professioneel") that must not shift the fuel indices.
+    """
+    section = soup.find("app-fair-price")
+    if not isinstance(section, Tag):
         return []
-    return [span.get_text().strip() for span in switch.find_all("span", class_="option")]
+    return [
+        element.get_text().strip()
+        for element in section.find_all(class_="radio-label")
+    ]
 
 
 def _parse_prices(html: str) -> dict[str, float]:
-    """Pull the tariffs off the Energie.be landing page.
+    """Pull the tariffs off the Energie.be tariff page.
 
     Runs in the executor: this parses roughly 800 kB of markup, which is far too
     much blocking work to do on the event loop.
@@ -192,23 +232,52 @@ class EnergieBeCoordinator(DataUpdateCoordinator[EnergieBeData]):
         )
 
     async def _async_scrape_prices(self) -> dict[str, float]:
-        """Fetch and parse the Energie.be landing page."""
-        try:
-            async with self._session.get(
-                URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                response.raise_for_status()
-                html = await response.text()
-        except TimeoutError as err:
-            raise UpdateFailed(
-                f"Timeout fetching {URL}", retry_after=_RETRY_AFTER
-            ) from err
-        except aiohttp.ClientError as err:
-            raise UpdateFailed(
-                f"Error fetching {URL}: {err}", retry_after=_RETRY_AFTER
-            ) from err
-
+        """Fetch and parse the Energie.be tariff page."""
+        html = await self._async_fetch_tariff_page()
         return await self.hass.async_add_executor_job(_parse_prices, html)
+
+    async def _async_fetch_tariff_page(self) -> str:
+        """Return the tariff page, reasking until an instance serves it.
+
+        See MAX_SCRAPE_ATTEMPTS: the site load-balances across instances whose
+        caches hold each other's pages, so asking again is the only way through
+        -- but only if we shed the affinity cookie first, otherwise every retry
+        goes back to the same instance and gets the same wrong page.
+        """
+        for attempt in range(1, MAX_SCRAPE_ATTEMPTS + 1):
+            self._session.cookie_jar.clear_domain(_SCRAPE_HOST)
+            try:
+                async with self._session.get(
+                    URL, timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response.raise_for_status()
+                    html = await response.text()
+            except TimeoutError as err:
+                raise UpdateFailed(
+                    f"Timeout fetching {URL}", retry_after=_RETRY_AFTER
+                ) from err
+            except aiohttp.ClientError as err:
+                raise UpdateFailed(
+                    f"Error fetching {URL}: {err}", retry_after=_RETRY_AFTER
+                ) from err
+
+            if _TARIFF_MARKER in html:
+                if attempt > 1:
+                    _LOGGER.debug(
+                        "Got the Energie.be tariff page on attempt %s of %s",
+                        attempt,
+                        MAX_SCRAPE_ATTEMPTS,
+                    )
+                return html
+
+        # Every instance we reached served something else. That is the site
+        # misbehaving rather than markup we need to relearn, so come back in
+        # half an hour instead of waiting for tomorrow's slot.
+        raise UpdateFailed(
+            f"{URL} served a page without {_TARIFF_MARKER} on all "
+            f"{MAX_SCRAPE_ATTEMPTS} attempts",
+            retry_after=_RETRY_AFTER,
+        )
 
     async def _async_conversion_factor(self) -> tuple[float, str]:
         """Return the m³ conversion factor and where it came from."""
